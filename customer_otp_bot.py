@@ -340,17 +340,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     domains_text = _allowed_domains_text()
 
+    # ✅ UPDATED WELCOME MESSAGE WITH CLEAR REAL EXAMPLES
     welcome_text = (
-        f"✨ Welcome to Digital Creed OTP Service ✨\n\n"
-        f"🔹 Need a quick OTP? Just send:\n"
-        f"/otp yourname@yourdomain\n\n"
+        "✨ Welcome to Digital Creed OTP Service ✨\n\n"
+        "📌 HOW TO USE:\n"
+        "Send the command in this format:\n\n"
+        "👉 /otp username@domain.com\n\n"
+        "📩 REAL EXAMPLES:\n"
+        "• /otp dcreedprivate.kaviska@eliotkids.com\n"
+        "• /otp dcplus.ajanthan41@kabarr.com\n\n"
         f"✅ Allowed domains: {domains_text}\n\n"
         f"⏱️ I’ll wait {DELAY_SECONDS} seconds before checking your inbox to make sure your code arrives.\n\n"
         f"👤 Each user can make up to {MAX_REQUESTS_PER_USER} requests in total.\n\n"
-        f"🚫 After every check — whether an OTP is found or not — please wait 3 minutes before making another request.\n\n"
-        f"💡 Tip: Double-check your email spelling for faster results!\n\n"
-        f"📩 Example:\n"
-        f"/otp yourname@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
+        "🚫 After every check — whether an OTP is found or not — please wait 3 minutes before making another request.\n\n"
+        "⚠️ Make sure there is NO space after /otp and your email is typed correctly.\n"
     )
 
     await update.message.reply_text(welcome_text)
@@ -376,9 +379,14 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if not context.args:
+        # ✅ UPDATED: show real examples so people don’t get confused
         await update.message.reply_text(
-            "❌ Please provide an email address.\n"
-            f"Example: /otp yourname@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
+            "❌ Please provide an email address.\n\n"
+            "Use this format:\n"
+            "/otp username@domain.com\n\n"
+            "Examples:\n"
+            "/otp dcreedprivate.kaviska@eliotkids.com\n"
+            "/otp dcplus.ajanthan41@kabarr.com"
         )
         return
 
