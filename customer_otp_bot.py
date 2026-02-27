@@ -14,11 +14,11 @@ from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ✅ ADDED: Telegram request config + network error types
+# ✅ Telegram request config + network error types
 from telegram.request import HTTPXRequest
 from telegram.error import Forbidden, RetryAfter, BadRequest, TimedOut, NetworkError
 
-# ✅ ADDED: Redis (shared storage for watcher watchlist)
+# ✅ Redis (shared storage for watcher watchlist)
 import redis.asyncio as redis
 
 logging.basicConfig(
@@ -42,7 +42,15 @@ DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 COOLDOWN_SECONDS = 91  # ~3 minutes cooldown after success OR "no OTP"
 
-# ✅ ADDED: Redis URL for shared watchlist storage
+# ✅ NEW: Special domain(s) where limit applies per EMAIL instead of Telegram ID
+EMAIL_QUOTA_DOMAINS = [
+    d.strip().lower()
+    for d in os.getenv("EMAIL_QUOTA_DOMAINS", "").split(",")
+    if d.strip()
+]
+EMAIL_QUOTA_LIMIT = int(os.getenv("EMAIL_QUOTA_LIMIT", "10"))
+
+# ✅ Redis URL for shared watchlist storage
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 
 # Self-healing knobs (optional)
@@ -52,7 +60,7 @@ ERROR_RESTART_THRESHOLD = int(os.getenv("ERROR_RESTART_THRESHOLD", "6"))  # rest
 
 OTP_PATTERN = re.compile(r"\b(\d{6})\b")
 
-# ✅ ADDED: Redis keys for warning watcher
+# ✅ Redis keys for warning watcher
 WATCHLIST_KEY = "warn:watchlist"          # Redis SET of emails
 INTERVAL_KEY = "warn:interval_min"        # Redis STRING minutes
 
@@ -72,7 +80,18 @@ def _parse_ids(text: str):
     return [int(x) for x in re.findall(r"\d+", text or "")]
 
 
-# ✅ ADDED: Redis client (used by new /wadd /wremove /wlist /winterval commands)
+def _email_domain(email: str) -> str:
+    if "@" not in email:
+        return ""
+    return email.split("@", 1)[1].strip().lower()
+
+
+def _is_email_quota_domain(email: str) -> bool:
+    d = _email_domain(email)
+    return d in EMAIL_QUOTA_DOMAINS if d else False
+
+
+# ✅ Redis client (used by new /wadd /wremove /wlist /winterval commands)
 redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
 
@@ -93,7 +112,8 @@ class StateManager:
         else:
             data = {}
 
-        data.setdefault("user_requests", {})
+        data.setdefault("user_requests", {})   # telegram-id based success counts
+        data.setdefault("email_requests", {})  # ✅ NEW: email-based success counts for special domains
         data.setdefault("cached_otps", {})
         data.setdefault("cooldowns", {})
         data.setdefault("blocked_emails", {})
@@ -108,7 +128,7 @@ class StateManager:
         except Exception as e:
             logger.error(f"Error saving state: {e}")
 
-    # ---- quotas ----
+    # ---- quotas (telegram id) ----
     def get_user_requests(self, user_id: int) -> int:
         return self.state["user_requests"].get(str(user_id), 0)
 
@@ -122,6 +142,24 @@ class StateManager:
         if uid in self.state["user_requests"]:
             del self.state["user_requests"][uid]
         self._save_state()
+
+    # ---- quotas (email) ✅ NEW ----
+    def get_email_requests(self, email: str) -> int:
+        email = (email or "").strip().lower()
+        return self.state["email_requests"].get(email, 0)
+
+    def increment_email_requests(self, email: str):
+        email = (email or "").strip().lower()
+        self.state["email_requests"][email] = self.state["email_requests"].get(email, 0) + 1
+        self._save_state()
+
+    def reset_email_limit(self, email: str) -> bool:
+        email = (email or "").strip().lower()
+        if email in self.state["email_requests"]:
+            del self.state["email_requests"][email]
+            self._save_state()
+            return True
+        return False
 
     # ---- otp cache ----
     def cache_otp(self, email: str, otp: str):
@@ -214,7 +252,6 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
 
     max_retries = 3
 
-    # ✅ Slightly more forgiving timeout for generator.email
     async with httpx.AsyncClient(timeout=httpx.Timeout(25.0), follow_redirects=True) as client:
         for attempt in range(max_retries):
             try:
@@ -340,7 +377,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     domains_text = _allowed_domains_text()
 
-    # ✅ UPDATED WELCOME MESSAGE WITH CLEAR REAL EXAMPLES
+    extra = ""
+    if EMAIL_QUOTA_DOMAINS:
+        extra = (
+            "\n📌 Special rule:\n"
+            f"• For domain(s): {', '.join('@'+d for d in EMAIL_QUOTA_DOMAINS)}\n"
+            f"  OTP limit is per EMAIL (not per Telegram ID): {EMAIL_QUOTA_LIMIT}\n"
+        )
+
     welcome_text = (
         "✨ Welcome to Digital Creed OTP Service ✨\n\n"
         "📌 HOW TO USE:\n"
@@ -351,9 +395,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /otp dcplus.ajanthan41@kabarr.com\n\n"
         f"✅ Allowed domains: {domains_text}\n\n"
         f"⏱️ I’ll wait {DELAY_SECONDS} seconds before checking your inbox to make sure your code arrives.\n\n"
-        f"👤 Each user can make up to {MAX_REQUESTS_PER_USER} requests in total.\n\n"
+        f"👤 Each user can make up to {MAX_REQUESTS_PER_USER} successful OTP requests in total.\n\n"
         "🚫 After every check — whether an OTP is found or not — please wait 3 minutes before making another request.\n\n"
         "⚠️ Make sure there is NO space after /otp and your email is typed correctly.\n"
+        + extra
     )
 
     await update.message.reply_text(welcome_text)
@@ -379,7 +424,6 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if not context.args:
-        # ✅ UPDATED: show real examples so people don’t get confused
         await update.message.reply_text(
             "❌ Please provide an email address.\n\n"
             "Use this format:\n"
@@ -396,6 +440,9 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Invalid email domain. Only {_allowed_domains_text()} is supported.")
         return
 
+    # ✅ choose quota mode
+    use_email_quota = (not is_admin) and _is_email_quota_domain(email)
+
     if state_manager.is_blocked(email):
         if not is_admin:
             state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
@@ -409,19 +456,32 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No OTP found right now. Please try again later.")
         return
 
+    # ✅ quota check
     if not is_admin:
-        current_requests = state_manager.get_user_requests(user.id)
-        if current_requests >= MAX_REQUESTS_PER_USER:
-            await update.message.reply_text(f"⛔ You reached your limit ({MAX_REQUESTS_PER_USER}).")
-            return
-        remaining_if_success = MAX_REQUESTS_PER_USER - (current_requests + 1)
+        if use_email_quota:
+            current_requests = state_manager.get_email_requests(email)
+            if current_requests >= EMAIL_QUOTA_LIMIT:
+                await update.message.reply_text(f"⛔ This email reached its limit ({EMAIL_QUOTA_LIMIT}).")
+                return
+            remaining_if_success = EMAIL_QUOTA_LIMIT - (current_requests + 1)
+        else:
+            current_requests = state_manager.get_user_requests(user.id)
+            if current_requests >= MAX_REQUESTS_PER_USER:
+                await update.message.reply_text(f"⛔ You reached your limit ({MAX_REQUESTS_PER_USER}).")
+                return
+            remaining_if_success = MAX_REQUESTS_PER_USER - (current_requests + 1)
     else:
         remaining_if_success = "∞"
+
+    quota_note = ""
+    if use_email_quota:
+        quota_note = f"\n🎯 Limit mode: PER EMAIL ({EMAIL_QUOTA_LIMIT})"
 
     await update.message.reply_text(
         f"⏳ Waiting {DELAY_SECONDS} seconds before checking…\n"
         f"📧 {email}\n"
         f"📊 Remaining (if success): {remaining_if_success}"
+        f"{quota_note}"
     )
 
     if not is_admin:
@@ -433,8 +493,13 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             otp = await fetch_otp_from_generator(email)
 
             if otp:
+                # ✅ increment correct quota bucket only when success
                 if not is_admin:
-                    state_manager.increment_user_requests(user.id)
+                    if use_email_quota:
+                        state_manager.increment_email_requests(email)
+                    else:
+                        state_manager.increment_user_requests(user.id)
+
                 state_manager.cache_otp(email, otp)
 
                 if not is_admin:
@@ -448,9 +513,14 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 _note_net_success()
 
+                # ✅ compute remaining after success
                 if not is_admin:
-                    now_used = state_manager.get_user_requests(user.id)
-                    remaining = MAX_REQUESTS_PER_USER - now_used
+                    if use_email_quota:
+                        now_used = state_manager.get_email_requests(email)
+                        remaining = EMAIL_QUOTA_LIMIT - now_used
+                    else:
+                        now_used = state_manager.get_user_requests(user.id)
+                        remaining = MAX_REQUESTS_PER_USER - now_used
                 else:
                     remaining = "∞"
 
@@ -458,7 +528,8 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ OTP Found!\n\n"
                     f"🔢 Code: `{otp}`\n"
                     f"📧 {email}\n"
-                    f"📊 Remaining: {remaining}",
+                    f"📊 Remaining: {remaining}"
+                    + (f"\n🎯 Mode: PER EMAIL ({EMAIL_QUOTA_LIMIT})" if use_email_quota else ""),
                     parse_mode="Markdown",
                 )
                 return
@@ -525,6 +596,7 @@ async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text = f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n✅ No cooldown active"
 
+    # Note: for special per-email quota, remaining depends on the email, so we don’t show it here.
     await update.message.reply_text(text)
 
 
@@ -785,7 +857,7 @@ async def addusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Added {after - before} users to subscribers.")
 
 
-# ✅ ADDED: Watchlist commands (admin only) using Redis
+# ✅ Watchlist commands (admin only) using Redis
 async def wadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -969,7 +1041,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _build_application() -> Application:
-    # ✅ FIX: Bigger Telegram API timeouts so getMe() doesn't kill you on slow networks
     tg_request = HTTPXRequest(
         connect_timeout=30,
         read_timeout=30,
@@ -996,7 +1067,7 @@ def _build_application() -> Application:
     app.add_handler(CommandHandler("dash", dash_command))
     app.add_handler(CommandHandler("addusers", addusers_command))
 
-    # ✅ ADDED: Watchlist handlers for warning watcher (admin only)
+    # Watchlist handlers
     app.add_handler(CommandHandler("wadd", wadd_command))
     app.add_handler(CommandHandler("wremove", wremove_command))
     app.add_handler(CommandHandler("wlist", wlist_command))
@@ -1020,18 +1091,16 @@ def main():
     logger.info("Starting OTP bot...")
     _start_timed_restart_thread()
 
-    # ✅ FIX: never crash hard on Telegram startup timeouts; retry with backoff hhh
     backoff = 2
     while True:
         try:
             application = _build_application()
             application.run_polling(allowed_updates=Update.ALL_TYPES)
-            # If it exits normally, reset backoff and loop (or just break)
             backoff = 2
         except (TimedOut, NetworkError, httpx.HTTPError, OSError) as e:
             logger.error(f"Telegram/network startup error: {e} — retrying in {backoff}s")
             time.sleep(backoff)
-            backoff = min(backoff * 2, 60)  # cap at 60s
+            backoff = min(backoff * 2, 60)
             continue
         except Exception as e:
             logger.exception(f"Fatal unexpected error: {e}")
