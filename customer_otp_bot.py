@@ -14,11 +14,9 @@ from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ✅ Telegram request config + network error types
 from telegram.request import HTTPXRequest
 from telegram.error import Forbidden, RetryAfter, BadRequest, TimedOut, NetworkError
 
-# ✅ Redis (shared storage for watcher watchlist)
 import redis.asyncio as redis
 
 logging.basicConfig(
@@ -42,7 +40,7 @@ DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 COOLDOWN_SECONDS = 91  # ~3 minutes cooldown after success OR "no OTP"
 
-# ✅ NEW: Special domain(s) where limit applies per EMAIL instead of Telegram ID
+# Special domain(s) where limit applies per EMAIL instead of Telegram ID
 EMAIL_QUOTA_DOMAINS = [
     d.strip().lower()
     for d in os.getenv("EMAIL_QUOTA_DOMAINS", "").split(",")
@@ -50,21 +48,22 @@ EMAIL_QUOTA_DOMAINS = [
 ]
 EMAIL_QUOTA_LIMIT = int(os.getenv("EMAIL_QUOTA_LIMIT", "10"))
 
-# ✅ Redis URL for shared watchlist storage
+# ✅ NEW: Require users to be member of this channel/group to use bot
+# Example: REQUIRED_CHAT_ID=@mychannel  OR  REQUIRED_CHAT_ID=-1001234567890
+REQUIRED_CHAT_ID = os.getenv("REQUIRED_CHAT_ID", "").strip()
+
+# Redis URL for shared watchlist storage
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 
-# Self-healing knobs (optional)
 RESTART_EVERY_MIN = int(os.getenv("RESTART_EVERY_MIN", "0"))  # 0 = disabled
-ERROR_RESTART_THRESHOLD = int(os.getenv("ERROR_RESTART_THRESHOLD", "6"))  # restart if this many network errors in a row
+ERROR_RESTART_THRESHOLD = int(os.getenv("ERROR_RESTART_THRESHOLD", "6"))
 # ---------------------------
 
 OTP_PATTERN = re.compile(r"\b(\d{6})\b")
 
-# ✅ Redis keys for warning watcher
-WATCHLIST_KEY = "warn:watchlist"          # Redis SET of emails
-INTERVAL_KEY = "warn:interval_min"        # Redis STRING minutes
+WATCHLIST_KEY = "warn:watchlist"
+INTERVAL_KEY = "warn:interval_min"
 
-# Track consecutive network-ish errors for auto-restart
 _CONSEC_ERRORS = 0
 
 
@@ -91,7 +90,69 @@ def _is_email_quota_domain(email: str) -> bool:
     return d in EMAIL_QUOTA_DOMAINS if d else False
 
 
-# ✅ Redis client (used by new /wadd /wremove /wlist /winterval commands)
+def _required_chat_display() -> str:
+    if not REQUIRED_CHAT_ID:
+        return ""
+    return REQUIRED_CHAT_ID
+
+
+async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Returns True if user is allowed (member/admin/creator) OR if REQUIRED_CHAT_ID not set OR if admin bypass.
+    Returns False and sends a message if user is not a member.
+    """
+    if not update.effective_user:
+        return False
+
+    user_id = update.effective_user.id
+
+    # Admin bypass (optional)
+    if user_id in ADMIN_IDS:
+        return True
+
+    # If not configured, do nothing
+    if not REQUIRED_CHAT_ID:
+        return True
+
+    try:
+        member = await context.bot.get_chat_member(chat_id=REQUIRED_CHAT_ID, user_id=user_id)
+        status = getattr(member, "status", "")
+        # allowed statuses
+        if status in ("member", "administrator", "creator"):
+            return True
+
+        # Not a member / left / kicked / restricted
+        if update.message:
+            await update.message.reply_text(
+                f"⛔ You must join our channel to use this bot.\n\n"
+                f"✅ Join: {_required_chat_display()}\n"
+                f"Then try again."
+            )
+        return False
+
+    except Forbidden:
+        # Bot not allowed to see members (usually bot not admin in channel)
+        if update.message:
+            await update.message.reply_text(
+                "⚠️ Bot cannot verify your channel membership right now.\n"
+                "Admin needs to add the bot as an admin in the required channel."
+            )
+        return False
+    except BadRequest as e:
+        # wrong chat id or private channel etc.
+        if update.message:
+            await update.message.reply_text(
+                f"⚠️ Membership check failed (bad chat id).\n"
+                f"Please contact admin.\n\nError: {e}"
+            )
+        return False
+    except Exception as e:
+        logger.error(f"Membership check error: {e}")
+        if update.message:
+            await update.message.reply_text("⚠️ Could not verify membership. Please try again later.")
+        return False
+
+
 redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
 
@@ -112,13 +173,12 @@ class StateManager:
         else:
             data = {}
 
-        data.setdefault("user_requests", {})   # telegram-id based success counts
-        data.setdefault("email_requests", {})  # ✅ NEW: email-based success counts for special domains
+        data.setdefault("user_requests", {})
+        data.setdefault("email_requests", {})
         data.setdefault("cached_otps", {})
         data.setdefault("cooldowns", {})
         data.setdefault("blocked_emails", {})
         data.setdefault("subscribers", [])
-
         return data
 
     def _save_state(self):
@@ -128,7 +188,6 @@ class StateManager:
         except Exception as e:
             logger.error(f"Error saving state: {e}")
 
-    # ---- quotas (telegram id) ----
     def get_user_requests(self, user_id: int) -> int:
         return self.state["user_requests"].get(str(user_id), 0)
 
@@ -143,7 +202,6 @@ class StateManager:
             del self.state["user_requests"][uid]
         self._save_state()
 
-    # ---- quotas (email) ✅ NEW ----
     def get_email_requests(self, email: str) -> int:
         email = (email or "").strip().lower()
         return self.state["email_requests"].get(email, 0)
@@ -153,15 +211,6 @@ class StateManager:
         self.state["email_requests"][email] = self.state["email_requests"].get(email, 0) + 1
         self._save_state()
 
-    def reset_email_limit(self, email: str) -> bool:
-        email = (email or "").strip().lower()
-        if email in self.state["email_requests"]:
-            del self.state["email_requests"][email]
-            self._save_state()
-            return True
-        return False
-
-    # ---- otp cache ----
     def cache_otp(self, email: str, otp: str):
         self.state["cached_otps"][email] = {
             "otp": otp,
@@ -176,7 +225,6 @@ class StateManager:
             return True
         return False
 
-    # ---- cooldowns ----
     def set_cooldown(self, user_id: int, seconds: int):
         next_allowed = int(time.time()) + seconds
         self.state["cooldowns"][str(user_id)] = next_allowed
@@ -189,7 +237,6 @@ class StateManager:
             return next_allowed - now
         return 0
 
-    # ---- blocked emails ----
     def is_blocked(self, email: str) -> bool:
         return email in self.state.get("blocked_emails", {})
 
@@ -207,7 +254,6 @@ class StateManager:
             return True
         return False
 
-    # ---- subscribers ----
     def add_subscriber(self, chat_id: int):
         cid = int(chat_id)
         if cid not in self.state["subscribers"]:
@@ -276,7 +322,6 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
                     else:
                         newest_url = "https://generator.email/" + newest_link
 
-                    logger.info(f"Opening newest email page: {newest_url}")
                     msg_resp = await client.get(newest_url, headers={**headers, "Referer": inbox_url})
                     msg_resp.raise_for_status()
                     msg_soup = BeautifulSoup(msg_resp.text, "html.parser")
@@ -284,9 +329,7 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
                     msg_text = msg_soup.get_text(" ", strip=True)
                     msg_matches = OTP_PATTERN.findall(msg_text)
                     if msg_matches:
-                        otp = msg_matches[0]
-                        logger.info(f"Found OTP in newest email body: {otp}")
-                        return otp
+                        return msg_matches[0]
 
                     iframe = msg_soup.find("iframe", src=True)
                     if iframe and iframe.get("src"):
@@ -298,26 +341,20 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
                         else:
                             iframe_url = "https://generator.email/" + iframe_src
 
-                        logger.info(f"Opening iframe for email body: {iframe_url}")
                         iframe_resp = await client.get(iframe_url, headers={**headers, "Referer": newest_url})
                         iframe_resp.raise_for_status()
                         iframe_text = BeautifulSoup(iframe_resp.text, "html.parser").get_text(" ", strip=True)
                         iframe_matches = OTP_PATTERN.findall(iframe_text)
                         if iframe_matches:
-                            otp = iframe_matches[0]
-                            logger.info(f"Found OTP in iframe email body: {otp}")
-                            return otp
+                            return iframe_matches[0]
 
                 email_bodies = soup.find_all(["div", "p", "span", "td"])
                 for element in email_bodies:
                     text = element.get_text()
                     matches = OTP_PATTERN.findall(text)
                     if matches:
-                        otp = matches[0]
-                        logger.info(f"Found OTP (fallback): {otp}")
-                        return otp
+                        return matches[0]
 
-                logger.warning(f"No OTP found in inbox for {email}")
                 return None
 
             except httpx.HTTPError as e:
@@ -330,7 +367,6 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
     return None
 
 
-# ---------------- Self-healing helpers ----------------
 def _start_timed_restart_thread():
     if RESTART_EVERY_MIN <= 0:
         return
@@ -368,44 +404,36 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    user = update.effective_user
-    if not user:
-        return
-
     if update.effective_chat:
         state_manager.add_subscriber(update.effective_chat.id)
 
     domains_text = _allowed_domains_text()
 
-    extra = ""
-    if EMAIL_QUOTA_DOMAINS:
-        extra = (
-            "\n📌 Special rule:\n"
-            f"• For domain(s): {', '.join('@'+d for d in EMAIL_QUOTA_DOMAINS)}\n"
-            f"  OTP limit is per EMAIL (not per Telegram ID): {EMAIL_QUOTA_LIMIT}\n"
-        )
+    join_text = ""
+    if REQUIRED_CHAT_ID:
+        join_text = f"\n🔒 Requirement: You must join {_required_chat_display()} to use this bot.\n"
 
-    welcome_text = (
+    await update.message.reply_text(
         "✨ Welcome to Digital Creed OTP Service ✨\n\n"
         "📌 HOW TO USE:\n"
-        "Send the command in this format:\n\n"
         "👉 /otp username@domain.com\n\n"
-        "📩 REAL EXAMPLES:\n"
+        "📩 Examples:\n"
         "• /otp dcreedprivate.kaviska@eliotkids.com\n"
         "• /otp dcplus.ajanthan41@kabarr.com\n\n"
-        f"✅ Allowed domains: {domains_text}\n\n"
-        f"⏱️ I’ll wait {DELAY_SECONDS} seconds before checking your inbox to make sure your code arrives.\n\n"
-        f"👤 Each user can make up to {MAX_REQUESTS_PER_USER} successful OTP requests in total.\n\n"
-        "🚫 After every check — whether an OTP is found or not — please wait 3 minutes before making another request.\n\n"
-        "⚠️ Make sure there is NO space after /otp and your email is typed correctly.\n"
-        + extra
+        f"✅ Allowed domains: {domains_text}\n"
+        f"⏱️ Wait: {DELAY_SECONDS} seconds before checking.\n"
+        f"👤 Limit: {MAX_REQUESTS_PER_USER} successful OTPs per Telegram user (default).\n"
+        + join_text
     )
-
-    await update.message.reply_text(welcome_text)
 
 
 async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
+        return
+
+    # ✅ membership gate
+    ok = await require_membership(update, context)
+    if not ok:
         return
 
     user = update.effective_user
@@ -426,11 +454,8 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "❌ Please provide an email address.\n\n"
-            "Use this format:\n"
-            "/otp username@domain.com\n\n"
-            "Examples:\n"
-            "/otp dcreedprivate.kaviska@eliotkids.com\n"
-            "/otp dcplus.ajanthan41@kabarr.com"
+            "Use:\n"
+            "/otp username@domain.com"
         )
         return
 
@@ -440,23 +465,14 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Invalid email domain. Only {_allowed_domains_text()} is supported.")
         return
 
-    # ✅ choose quota mode
     use_email_quota = (not is_admin) and _is_email_quota_domain(email)
 
     if state_manager.is_blocked(email):
         if not is_admin:
             state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
-
-        try:
-            with open("otp_log.txt", "a") as lf:
-                lf.write(f"[{datetime.now()}] user={user.id} email={email} result=NO_OTP\n")
-        except Exception:
-            pass
-
         await update.message.reply_text("❌ No OTP found right now. Please try again later.")
         return
 
-    # ✅ quota check
     if not is_admin:
         if use_email_quota:
             current_requests = state_manager.get_email_requests(email)
@@ -473,15 +489,11 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         remaining_if_success = "∞"
 
-    quota_note = ""
-    if use_email_quota:
-        quota_note = f"\n🎯 Limit mode: PER EMAIL ({EMAIL_QUOTA_LIMIT})"
-
     await update.message.reply_text(
         f"⏳ Waiting {DELAY_SECONDS} seconds before checking…\n"
         f"📧 {email}\n"
         f"📊 Remaining (if success): {remaining_if_success}"
-        f"{quota_note}"
+        + (f"\n🎯 Mode: PER EMAIL ({EMAIL_QUOTA_LIMIT})" if use_email_quota else "")
     )
 
     if not is_admin:
@@ -493,7 +505,6 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             otp = await fetch_otp_from_generator(email)
 
             if otp:
-                # ✅ increment correct quota bucket only when success
                 if not is_admin:
                     if use_email_quota:
                         state_manager.increment_email_requests(email)
@@ -505,15 +516,8 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not is_admin:
                     state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
 
-                try:
-                    with open("otp_log.txt", "a") as lf:
-                        lf.write(f"[{datetime.now()}] user={user.id} email={email} result=OTP:{otp}\n")
-                except Exception:
-                    pass
-
                 _note_net_success()
 
-                # ✅ compute remaining after success
                 if not is_admin:
                     if use_email_quota:
                         now_used = state_manager.get_email_requests(email)
@@ -533,27 +537,15 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown",
                 )
                 return
+
             else:
                 if not is_admin:
                     state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
-
-                try:
-                    with open("otp_log.txt", "a") as lf:
-                        lf.write(f"[{datetime.now()}] user={user.id} email={email} result=NO_OTP\n")
-                except Exception:
-                    pass
-
                 _note_net_success()
                 await update.message.reply_text("❌ No OTP found right now. Please try again later.")
                 return
 
         except httpx.HTTPError:
-            try:
-                with open("otp_log.txt", "a") as lf:
-                    lf.write(f"[{datetime.now()}] user={user.id} email={email} result=NETWORK_ERROR attempt={round_idx}\n")
-            except Exception:
-                pass
-
             if round_idx < max_rounds:
                 await update.message.reply_text(
                     f"⚠️ Network issue (attempt {round_idx}/{max_rounds}). Retrying in 5 seconds..."
@@ -567,13 +559,6 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             logger.error(f"Unexpected error in otp_command: {e}")
-
-            try:
-                with open("otp_log.txt", "a") as lf:
-                    lf.write(f"[{datetime.now()}] user={user.id} email={email} result=UNEXPECTED_ERROR:{str(e)[:120]}\n")
-            except Exception:
-                pass
-
             _note_net_error_and_maybe_restart()
             await update.message.reply_text("❌ An unexpected error occurred. Please try again.")
             return
@@ -583,12 +568,16 @@ async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
+    # ✅ membership gate
+    ok = await require_membership(update, context)
+    if not ok:
+        return
+
     user = update.effective_user
     if not user:
         return
 
     current_requests = state_manager.get_user_requests(user.id)
-    remaining = MAX_REQUESTS_PER_USER - current_requests
     cd = state_manager.remaining_cooldown(user.id)
 
     if cd > 0:
@@ -596,444 +585,7 @@ async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text = f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n✅ No cooldown active"
 
-    # Note: for special per-email quota, remaining depends on the email, so we don’t show it here.
     await update.message.reply_text(text)
-
-
-async def resetlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    user = update.effective_user
-    if not user:
-        return
-
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("❌ Usage: /resetlimit <user_id>")
-        return
-
-    try:
-        target_user_id = int(context.args[0])
-        state_manager.reset_user_limit(target_user_id)
-        await update.message.reply_text(f"✅ Reset done for user {target_user_id}")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID (must be a number).")
-
-
-async def clearemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    user = update.effective_user
-    if not user:
-        return
-
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Usage: /clearemail <email>\n"
-            f"Example: /clearemail user@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
-        )
-        return
-
-    email = context.args[0].lower()
-    if state_manager.clear_email(email):
-        await update.message.reply_text(f"✅ Cached OTP cleared for {email}")
-    else:
-        await update.message.reply_text(f"ℹ️ No cached OTP found for {email}")
-
-
-async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    user = update.effective_user
-    if not user:
-        return
-
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Usage: /block <email>\n"
-            f"Example: /block user@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
-        )
-        return
-
-    email = context.args[0].strip().lower()
-    if not _is_allowed_domain(email):
-        await update.message.reply_text(f"❌ Invalid email domain. Only {_allowed_domains_text()} is supported.")
-        return
-
-    state_manager.block_email(email, user.id)
-
-    try:
-        with open("otp_log.txt", "a") as lf:
-            lf.write(f"[{datetime.now()}] user={user.id} email={email} action=BLOCK\n")
-    except Exception:
-        pass
-
-    await update.message.reply_text("✅ Done.")
-
-
-async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    user = update.effective_user
-    if not user:
-        return
-
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Usage: /unblock <email>\n"
-            f"Example: /unblock user@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
-        )
-        return
-
-    email = context.args[0].strip().lower()
-    if not _is_allowed_domain(email):
-        await update.message.reply_text(f"❌ Invalid email domain. Only {_allowed_domains_text()} is supported.")
-        return
-
-    ok = state_manager.unblock_email(email)
-
-    try:
-        with open("otp_log.txt", "a") as lf:
-            lf.write(f"[{datetime.now()}] user={user.id} email={email} action=UNBLOCK ok={ok}\n")
-    except Exception:
-        pass
-
-    await update.message.reply_text("✅ Done." if ok else "ℹ️ Not found.")
-
-
-async def showlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ This command is restricted to admins only.")
-        return
-
-    log_file = "otp_log.txt"
-    try:
-        with open(log_file, "r") as f:
-            lines = f.readlines()
-
-        if not lines:
-            await update.message.reply_text("📭 Log file is empty.")
-            return
-
-        full_log = "".join(lines)
-
-        if len(full_log) > 4000:
-            chunks = [full_log[i:i + 4000] for i in range(0, len(full_log), 4000)]
-            for i, chunk in enumerate(chunks, start=1):
-                await update.message.reply_text(f"📜 Log Part {i}:\n\n{chunk}")
-        else:
-            await update.message.reply_text(f"🧾 Full Log:\n\n{full_log}")
-
-    except FileNotFoundError:
-        await update.message.reply_text("⚠️ No log file found yet.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error reading log: {e}")
-
-
-async def dash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    user = update.effective_user
-    if not user:
-        return
-
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    subscribers = state_manager.get_subscribers()
-    if not subscribers:
-        await update.message.reply_text("ℹ️ No users to broadcast to yet.")
-        return
-
-    bot = context.bot
-
-    if update.message.reply_to_message:
-        src_chat_id = update.message.reply_to_message.chat_id
-        src_message_id = update.message.reply_to_message.message_id
-
-        sent = 0
-        failed = 0
-
-        for chat_id in subscribers:
-            try:
-                await bot.copy_message(
-                    chat_id=chat_id,
-                    from_chat_id=src_chat_id,
-                    message_id=src_message_id,
-                )
-                sent += 1
-                await asyncio.sleep(0.05)
-            except RetryAfter as e:
-                await asyncio.sleep(int(getattr(e, "retry_after", 1)))
-            except Forbidden:
-                state_manager.remove_subscriber(chat_id)
-                failed += 1
-            except BadRequest:
-                failed += 1
-            except Exception:
-                failed += 1
-
-        await update.message.reply_text(f"✅ Broadcast done. Sent: {sent}, Failed: {failed}")
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Usage:\n"
-            "1) /dash <text to broadcast>\n"
-            "2) Reply to a message (photo/text/etc) with /dash to broadcast it."
-        )
-        return
-
-    text = " ".join(context.args)
-
-    sent = 0
-    failed = 0
-
-    for chat_id in subscribers:
-        try:
-            await bot.send_message(chat_id=chat_id, text=text)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except RetryAfter as e:
-            await asyncio.sleep(int(getattr(e, "retry_after", 1)))
-        except Forbidden:
-            state_manager.remove_subscriber(chat_id)
-            failed += 1
-        except Exception:
-            failed += 1
-
-    await update.message.reply_text(f"✅ Broadcast done. Sent: {sent}, Failed: {failed}")
-
-
-async def addusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    user = update.effective_user
-    if not user:
-        return
-
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("❌ Usage: /addusers 111,222,333")
-        return
-
-    ids = _parse_ids(" ".join(context.args))
-    if not ids:
-        await update.message.reply_text("❌ No user IDs found.")
-        return
-
-    before = len(state_manager.get_subscribers())
-    for cid in ids:
-        state_manager.add_subscriber(cid)
-    after = len(state_manager.get_subscribers())
-
-    await update.message.reply_text(f"✅ Added {after - before} users to subscribers.")
-
-
-# ✅ Watchlist commands (admin only) using Redis
-async def wadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    user = update.effective_user
-    if not user:
-        return
-
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    if not REDIS_URL or redis_client is None:
-        await update.message.reply_text("❌ REDIS_URL is not set. Cannot use watchlist commands.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("❌ Usage: /wadd email@domain OR /wadd a@d.com,b@d.com")
-        return
-
-    raw = " ".join(context.args).strip().lower()
-    parts = re.split(r"[,\s]+", raw)
-    emails = [p.strip() for p in parts if p.strip()]
-
-    if not emails:
-        await update.message.reply_text("❌ No emails found.")
-        return
-
-    added = 0
-    already = 0
-    invalid = []
-
-    for email in emails:
-        if not _is_allowed_domain(email):
-            invalid.append(email)
-            continue
-        try:
-            ok = await redis_client.sadd(WATCHLIST_KEY, email)
-            if ok:
-                added += 1
-            else:
-                already += 1
-        except Exception as e:
-            await update.message.reply_text(f"❌ Redis error: {e}")
-            return
-
-    msg = f"✅ Added: {added}\nℹ️ Already in list: {already}"
-    if invalid:
-        msg += "\n❌ Invalid domain:\n" + "\n".join(f"• {e}" for e in invalid[:30])
-        if len(invalid) > 30:
-            msg += f"\n… +{len(invalid) - 30} more"
-
-    await update.message.reply_text(msg)
-
-
-async def wremove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    user = update.effective_user
-    if not user:
-        return
-
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    if not REDIS_URL or redis_client is None:
-        await update.message.reply_text("❌ REDIS_URL is not set. Cannot use watchlist commands.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("❌ Usage: /wremove email@domain OR /wremove a@d.com,b@d.com")
-        return
-
-    raw = " ".join(context.args).strip().lower()
-    parts = re.split(r"[,\s]+", raw)
-    emails = [p.strip() for p in parts if p.strip()]
-
-    removed = 0
-    not_found = 0
-    invalid = []
-
-    for email in emails:
-        if not _is_allowed_domain(email):
-            invalid.append(email)
-            continue
-        try:
-            ok = await redis_client.srem(WATCHLIST_KEY, email)
-            if ok:
-                removed += 1
-            else:
-                not_found += 1
-        except Exception as e:
-            await update.message.reply_text(f"❌ Redis error: {e}")
-            return
-
-    msg = f"✅ Removed: {removed}\nℹ️ Not found: {not_found}"
-    if invalid:
-        msg += "\n❌ Invalid domain:\n" + "\n".join(f"• {e}" for e in invalid[:30])
-        if len(invalid) > 30:
-            msg += f"\n… +{len(invalid) - 30} more"
-
-    await update.message.reply_text(msg)
-
-
-async def wlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    user = update.effective_user
-    if not user:
-        return
-
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    if not REDIS_URL or redis_client is None:
-        await update.message.reply_text("❌ REDIS_URL is not set. Cannot use watchlist commands.")
-        return
-
-    try:
-        emails = await redis_client.smembers(WATCHLIST_KEY)
-        emails = sorted(list(emails))
-    except Exception as e:
-        await update.message.reply_text(f"❌ Redis error: {e}")
-        return
-
-    if not emails:
-        await update.message.reply_text("ℹ️ Watchlist empty.")
-        return
-
-    text = "📌 Watchlist:\n" + "\n".join(f"• {e}" for e in emails)
-    if len(text) > 3800:
-        text = text[:3800] + "\n…(trimmed)"
-    await update.message.reply_text(text)
-
-
-async def winterval_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    user = update.effective_user
-    if not user:
-        return
-
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    if not REDIS_URL or redis_client is None:
-        await update.message.reply_text("❌ REDIS_URL is not set. Cannot use watchlist commands.")
-        return
-
-    if not context.args:
-        try:
-            v = await redis_client.get(INTERVAL_KEY)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Redis error: {e}")
-            return
-        current = v if v else "not set"
-        await update.message.reply_text(f"⏱️ Current interval: {current} minutes\nUsage: /winterval 30")
-        return
-
-    try:
-        n = int(context.args[0])
-        if n < 1 or n > 1440:
-            raise ValueError()
-    except ValueError:
-        await update.message.reply_text("❌ Invalid minutes. Use 1..1440")
-        return
-
-    try:
-        await redis_client.set(INTERVAL_KEY, str(n))
-    except Exception as e:
-        await update.message.reply_text(f"❌ Redis error: {e}")
-        return
-
-    await update.message.reply_text(f"✅ Interval set to {n} minutes.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1059,19 +611,6 @@ def _build_application() -> Application:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("otp", otp_command))
     app.add_handler(CommandHandler("remaining", remaining_command))
-    app.add_handler(CommandHandler("resetlimit", resetlimit_command))
-    app.add_handler(CommandHandler("clearemail", clearemail_command))
-    app.add_handler(CommandHandler("block", block_command))
-    app.add_handler(CommandHandler("unblock", unblock_command))
-    app.add_handler(CommandHandler("log", showlog_command))
-    app.add_handler(CommandHandler("dash", dash_command))
-    app.add_handler(CommandHandler("addusers", addusers_command))
-
-    # Watchlist handlers
-    app.add_handler(CommandHandler("wadd", wadd_command))
-    app.add_handler(CommandHandler("wremove", wremove_command))
-    app.add_handler(CommandHandler("wlist", wlist_command))
-    app.add_handler(CommandHandler("winterval", winterval_command))
 
     app.add_error_handler(error_handler)
     return app
