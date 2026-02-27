@@ -549,7 +549,7 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if use_email_quota:
             dcd = state_manager.remaining_domain_cooldown(user.id, domain)
             if dcd > 0:
-                await update.message.reply_text(f"⏳ Please wait {dcd} seconds before requesting {domain} again.")
+                await update.message.reply_text(f"⏳ Please wait {dcd} seconds before requesting another temporary PRO account again")
                 return
         else:
             cd = state_manager.remaining_cooldown(user.id)
